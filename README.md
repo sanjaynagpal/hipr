@@ -115,3 +115,5 @@ Bodies appear as `text` when they are valid UTF-8 and as `base64` otherwise. `tr
 - Many clients skip the proxy for `localhost`. If traffic does not appear, check `NO_PROXY` and the browser's proxy bypass list.
 
 More detail is in [docs/architecture.md](docs/architecture.md).
+
+[examples/](examples/README.md) has a sample Service API protected by Microsoft Entra ID. It accepts tokens from signed-in users and app-only tokens from a service principal, and comes with a mock identity provider so it runs offline.
