@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-hipr is an HTTP/HTTPS proxy (forward or reverse) that records the traffic passing through it. Go 1.26+, **standard library only** — do not add third-party dependencies (`go.mod` has none). User-facing docs are in [README.md](README.md); design detail is in [docs/architecture.md](docs/architecture.md). Keep both in sync when changing flags, request flow, or output formats.
+hipr is an HTTP/HTTPS proxy (forward or reverse) that records the traffic passing through it. Go 1.26+, **standard library only** — do not add third-party dependencies (`go.mod` has none). User-facing docs are in [README.md](README.md); design detail is in [docs/architecture.md](docs/architecture.md); operator procedures and troubleshooting are in [docs/runbook.md](docs/runbook.md). Keep all three in sync when changing flags, request flow, or output formats.
 
 ## Commands
 
