@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -33,6 +34,28 @@ type Event struct {
 	BytesUp    int64         `json:"bytes_up,omitempty"`   // tunnels only
 	BytesDown  int64         `json:"bytes_down,omitempty"` // tunnels only
 	Error      string        `json:"error,omitempty"`
+	Notes      []string      `json:"notes,omitempty"` // what modifiers did to the request
+}
+
+// sensitive headers carry credentials; Redact masks them.
+var sensitive = []string{"Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie"}
+
+// Redact returns a copy of h with credential headers masked, so records can
+// be kept and shared without leaking tokens. The scheme of an Authorization
+// header ("Bearer") is kept.
+func Redact(h http.Header) http.Header {
+	h = h.Clone()
+	for _, k := range sensitive {
+		vs := h[k]
+		for i, v := range vs {
+			if scheme, rest, ok := strings.Cut(v, " "); ok && strings.HasSuffix(k, "Authorization") {
+				vs[i] = fmt.Sprintf("%s <redacted, %d bytes>", scheme, len(rest))
+			} else {
+				vs[i] = fmt.Sprintf("<redacted, %d bytes>", len(v))
+			}
+		}
+	}
+	return h
 }
 
 // Body is a captured message body. Data holds at most the configured limit
@@ -114,6 +137,9 @@ func (t *Text) Record(e *Event) {
 	fmt.Fprintln(t.W)
 	if !t.Verbose || e.Kind == "tunnel" {
 		return
+	}
+	for _, n := range e.Notes {
+		fmt.Fprintf(t.W, "  * %s\n", n)
 	}
 	t.section("> ", e.ReqHeader, e.ReqBody)
 	t.section("< ", e.RespHeader, e.RespBody)

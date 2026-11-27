@@ -60,6 +60,25 @@ The mock also registers `44444444-…` (secret `norole-secret`) with no app role
 
 mockentra creates a new signing key each time it starts. A running serviceapi picks the new key up on its own.
 
+### Let hipr add the token
+
+This is the regression-test setup. Run hipr with the `-auth-*` flags instead of terminal 3 above, and the tests call the API without any credentials:
+
+```
+# the secret from mockentra, as it would be stored in Vault: vault kv put secret/hipr/entra client_secret=regression-secret
+export VAULT_ADDR=http://127.0.0.1:8200 VAULT_ROLE_ID=<role id> VAULT_SECRET_ID=<secret id>
+hipr -addr 127.0.0.1:29000 -upstream http://127.0.0.1:29010 -v \
+  -auth-client-id 33333333-3333-3333-3333-333333333333 \
+  -auth-token-url http://127.0.0.1:29100/11111111-1111-1111-1111-111111111111/oauth2/v2.0/token \
+  -auth-scope api://hipr-sample-api/.default \
+  -auth-secret vault:secret/data/hipr/entra#client_secret
+
+curl http://127.0.0.1:29000/me                                   # {"kind":"app", ...}
+curl -d '{"name":"fixture"}' http://127.0.0.1:29000/items         # 201
+```
+
+Without a Vault at hand, `HIPR_SECRET=regression-secret` with `-auth-secret env:HIPR_SECRET` does the same. Against real Entra, replace `-auth-token-url` with `-auth-tenant <tenant-id>`. [hipr_test.go](serviceapi/hipr_test.go) runs this whole chain in-process.
+
 ## Tests
 
 ```
@@ -87,3 +106,15 @@ go run ./examples/serviceapi -tenant <tenant-id> -audience <api-client-id>,api:/
 ```
 
 hipr's token request is the same as above, sent to `https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token` with `scope=api://hipr-sample-api/.default`. Client credentials always use `/.default`: the app gets every app role it has been granted, not individual scopes.
+
+**4. Vault**: store the client secret, and give hipr's CI identity a policy that can read only that path:
+
+```
+vault kv put secret/hipr/entra client_secret=<secret from step 3>
+vault policy write hipr-read - <<'EOF'
+path "secret/data/hipr/entra" { capabilities = ["read"] }
+EOF
+vault write auth/approle/role/hipr-ci token_policies=hipr-read token_ttl=10m
+```
+
+When you rotate the secret, add the new one in Entra first, then update Vault, then remove the old one in Entra. hipr re-reads Vault when Entra rejects the old secret.

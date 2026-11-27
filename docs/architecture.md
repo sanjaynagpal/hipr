@@ -15,7 +15,12 @@ Both agree that without a CA a proxy sees only the host and port of HTTPS traffi
 main.go                     flags, wiring, graceful shutdown
 internal/proxy/proxy.go     the http.Handler: forward, tunnel, intercept, reverse
 internal/mitm/ca.go         local CA and per-host leaf certificates
-internal/inspect/inspect.go Event, Body and the Sink implementations
+internal/inspect/inspect.go Event, Body, Redact and the Sink implementations
+auth.go                     -auth-* flags: builds the token injector
+internal/auth/              Entra client credentials token source; Injector (the request modifier)
+internal/secret/            secret sources: Vault (token / AppRole, KV v1 and v2), env, file
+internal/entratest/         mock Entra ID (tests and examples/mockentra)
+internal/vaulttest/         fake Vault HTTP API (tests)
 ```
 
 ## Request flow
@@ -35,11 +40,12 @@ internal/inspect/inspect.go Event, Body and the Sink implementations
 
 All recorded HTTP traffic goes through `forward`:
 
-1. Build an `Event` and strip hop-by-hop headers from the outgoing request.
-2. Tee the request body into a capture buffer while the transport reads it.
-3. Send it with `http.Transport.RoundTrip`. A failure becomes a 502 and an `Error` on the event.
-4. Copy response headers, then stream the body to the client, flushing on each write so SSE and chunked responses are not delayed, while teeing it into a second capture buffer.
-5. A deferred function finalises the event and passes it to the `Sink`.
+1. Build an `Event` with the request headers as received, credentials masked by `inspect.Redact`, and strip hop-by-hop headers from the outgoing request.
+2. If `Options.Modifier` is set, call `ModifyRequest` on the outgoing request. Its note is added to `Event.Notes`. An error becomes a 502 and the request is not sent. Changes made here never reach the record, because the headers were captured in step 1.
+3. Tee the request body into a capture buffer while the transport reads it.
+4. Send it with `http.Transport.RoundTrip`. A failure becomes a 502 and an `Error` on the event. If the modifier also implements `ResponseModifier`, it sees the response next.
+5. Copy response headers, then stream the body to the client, flushing on each write so SSE and chunked responses are not delayed, while teeing it into a second capture buffer.
+6. A deferred function finalises the event and passes it to the `Sink`.
 
 The capture buffers keep only the first `-max-body` bytes but count every byte, so `Body.Size` is always the wire size.
 
@@ -79,13 +85,28 @@ With `-cert`/`-key`, `main.go` loads that pair with `tls.LoadX509KeyPair` and se
 
 To add a consumer (a HAR writer, a web UI, a filter), implement `Sink` and add it to the `Multi` in `main.go`.
 
+## Token injection
+
+`auth.Injector` is the only `RequestModifier`. For a request whose host is in `Hosts`, it asks `auth.ClientCredentials` for a token and sets `Authorization: Bearer`. A request that already has the header is left alone unless `Replace` is set, and plain `http` to a non-loopback host is refused. On a 401 from a matching host, `ModifyResponse` drops the cached token if it is still the one that was rejected.
+
+`ClientCredentials` holds a mutex while it fetches, so concurrent requests wait for one fetch instead of each calling Entra. It caches the token until `min(5m, lifetime/2)` before expiry. If a renewal fails, it keeps serving the old token while that is still valid.
+
+The client secret is read from its `secret.Source` once and kept. On `invalid_client` it is read again and the request retried once, which handles rotation. `secret.Vault` makes one HTTP read per call. With AppRole it logs in each time and revokes the token afterwards. Reads happen only at startup and on rotation, so no Vault token is kept.
+
+`main.go` gets one token before it starts listening, so configuration errors stop hipr at startup.
+
 ## Testing
 
-`internal/proxy/proxy_test.go` runs real servers on loopback and covers plain forwarding, blind tunnels, TLS interception with a throwaway CA, reverse mode, and an unreachable upstream.
+`internal/proxy/proxy_test.go` runs real servers on loopback and covers plain forwarding, blind tunnels, TLS interception with a throwaway CA, reverse mode, and an unreachable upstream. `modifier_test.go` covers the modifier hook and header masking.
+
+`internal/auth` and `internal/secret` run against `internal/entratest` and `internal/vaulttest`. `examples/serviceapi/hipr_test.go` runs the whole chain in-process: a client without a token, then hipr reading from Vault with AppRole and getting a token from Entra, then the sample API validating it.
+
+`vaulttest` mimics what real Vault does: multi-line error strings, and a 403 rather than a 404 for paths outside a policy. Both were found by checking against a real Vault dev server.
 
 ## Not yet implemented
 
-- Changing requests or responses (the Martian modifier idea). A natural step is a `Modifier` interface called from `forward` before the round trip and before the response is written.
+- Other request and response changes (the Martian modifier idea). The `RequestModifier` / `ResponseModifier` hook is in place.
+- Certificate and federated credentials, and managed identity, for token injection.
 - WebSocket / `Upgrade`.
 - HTTP/2 on intercepted connections.
 - Authentication on the proxy port.

@@ -32,7 +32,9 @@ func main() {
 		serveTLS = flag.Bool("tls", false, "serve HTTPS on the listen address using a certificate from the local CA")
 		certFile = flag.String("cert", "", "serve HTTPS using this PEM certificate (chain) instead of the local CA; implies -tls")
 		keyFile  = flag.String("key", "", "private key for -cert")
+		authOpts authFlags
 	)
+	authOpts.register()
 	flag.Parse()
 
 	if (*certFile == "") != (*keyFile == "") {
@@ -67,6 +69,13 @@ func main() {
 	}
 
 	opts := proxy.Options{Sink: sinks, MaxBody: *maxBody, Insecure: *insecure, Upstream: upURL}
+	injector, err := authOpts.setup(*addr, upURL, *doMITM)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if injector != nil { // a nil *Injector in the interface would not compare equal to nil
+		opts.Modifier = injector
+	}
 	srv := &http.Server{Addr: *addr, ReadHeaderTimeout: 15 * time.Second}
 	if served != nil {
 		srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{*served}}
@@ -109,7 +118,6 @@ func main() {
 		mode = "reverse proxy -> " + upURL.String()
 	}
 	fmt.Printf("hipr listening on %s (%s)\n", *addr, mode)
-	var err error
 	if *serveTLS {
 		err = srv.ListenAndServeTLS("", "")
 	} else {

@@ -73,6 +73,40 @@ hipr -addr :443 -upstream http://localhost:29010 -cert server-chain.pem -key ser
 
 `-cert` is a PEM file holding the certificate followed by any intermediates. It implies `-tls`, and no local CA is created.
 
+### Adding an access token (Microsoft Entra ID)
+
+hipr can call an API as its own service principal for clients that have no token, such as automated regression tests. It gets an access token from Entra ID with the OAuth 2.0 client credentials grant and adds it to requests as `Authorization: Bearer <token>`. The client secret comes from HashiCorp Vault.
+
+```
+export VAULT_ADDR=https://vault.example.com:8200
+export VAULT_ROLE_ID=<role id>  VAULT_SECRET_ID=<secret id>     # AppRole, the usual for CI
+
+hipr -addr 127.0.0.1:29000 -upstream https://api.corp.example \
+     -auth-tenant <tenant-id> -auth-client-id <hipr's application id> \
+     -auth-scope api://<api>/.default \
+     -auth-secret vault:secret/data/hipr/entra#client_secret
+```
+
+The tests then call `http://127.0.0.1:29000/...` without credentials.
+
+- **Secret.** `-auth-secret` is `vault:<path>#<field>`, `env:<NAME>` or `file:<path>`. The Vault path is the API path: for the KV version 2 engine it has `data/` after the mount, as in `secret/data/hipr/entra` for what `vault kv get secret/hipr/entra` shows.
+- **Logging in to Vault.** hipr uses the first of these that is set:
+  1. `VAULT_ROLE_ID` with `VAULT_SECRET_ID` or `VAULT_SECRET_ID_FILE` (AppRole). The login token is revoked after the read. Use `VAULT_APPROLE_MOUNT` if AppRole is not mounted at `approle`.
+  2. `VAULT_TOKEN_FILE`, for example a Vault Agent sink. It is read on every use.
+  3. `VAULT_TOKEN`.
+  4. `~/.vault-token`.
+
+  `VAULT_NAMESPACE` and `VAULT_CACERT` are honoured.
+- **Token lifetime.** hipr gets a token at startup, so a wrong secret, path or scope stops it at once. It caches the token and renews it 5 minutes before it expires. Concurrent requests share one renewal.
+- **Secret rotation.** The secret stays in memory. If Entra rejects it (`invalid_client`), hipr reads it from Vault again and retries once, so rotating it needs no restart.
+- **Rejected tokens.** A 401 from the API drops the cached token, and the next request gets a new one. The rejected request is not retried.
+- **Where the token goes.** It is sent only to `-auth-hosts`, which defaults to the `-upstream` host. To any host other than loopback it goes only over `https`.
+- **Requests that already have a token.** A request that already carries `Authorization` is passed on unchanged, unless `-auth-replace` is set. This lets a real user's token through untouched.
+- **Listen address.** Injection is refused on an address other than loopback, because anyone who can reach the port could call the API as hipr. `-auth-allow-remote` overrides this.
+- **Records.** They note that a token was added but never contain it. `Authorization`, `Proxy-Authorization`, `Cookie` and `Set-Cookie` are always masked.
+
+The service principal needs an app role on the API, and the API must accept app-only tokens. [examples/](examples/README.md) shows both, with a mock Entra ID to try it offline.
+
 ## Flags
 
 | Flag | Default | Description |
@@ -87,6 +121,14 @@ hipr -addr :443 -upstream http://localhost:29010 -cert server-chain.pem -key ser
 | `-v` | off | Print headers and bodies |
 | `-jsonl <file>` | none | Append every exchange to a file as JSON lines |
 | `-max-body` | `1048576` | Bytes of each request and response body to keep for inspection |
+| `-auth-client-id` | none | Add an Entra ID access token for this application to requests. Turns on token injection |
+| `-auth-tenant` | none | Entra tenant ID or domain, used to build the token endpoint |
+| `-auth-token-url` | from tenant | Token endpoint, overriding `-auth-tenant` (e.g. a mock) |
+| `-auth-scope` | none | Scope to request, e.g. `api://my-api/.default` |
+| `-auth-secret` | none | Client secret source: `vault:<path>#<field>`, `env:<NAME>` or `file:<path>` |
+| `-auth-hosts` | `-upstream` host | Comma-separated `host` or `host:port` values the token may be sent to |
+| `-auth-replace` | off | Replace an `Authorization` header the client sent |
+| `-auth-allow-remote` | off | Allow token injection on a non-loopback `-addr` |
 
 `-max-body` only limits what is recorded. Traffic is always forwarded in full.
 
@@ -102,14 +144,15 @@ hipr -addr :443 -upstream http://localhost:29010 -cert server-chain.pem -key ser
  "status":200,"resp_header":{...},"resp_body":{"size":577,"text":"<!doctype html>..."}}
 ```
 
-Bodies appear as `text` when they are valid UTF-8 and as `base64` otherwise. `truncated` is set when a body exceeded `-max-body`. gzip bodies are decoded before they are stored.
+Bodies appear as `text` when they are valid UTF-8 and as `base64` otherwise. `truncated` is set when a body exceeded `-max-body`. gzip bodies are decoded before they are stored. Credential headers are recorded masked, as `Bearer <redacted, 1234 bytes>`. `notes` lists what hipr changed, such as an added token.
 
 ## Limits
 
 - WebSocket and other `Upgrade` requests are not supported over plain HTTP.
 - Intercepted HTTPS is HTTP/1.1 only.
-- hipr observes traffic but cannot yet change it.
-- There is no authentication. Anyone who can reach the port can use the proxy, which is why it listens on `127.0.0.1` by default.
+- The only change hipr makes to traffic is adding an access token (`-auth-*`).
+- There is no authentication. Anyone who can reach the port can use the proxy, which is why it listens on `127.0.0.1` by default. With `-auth-*` that includes calling the API as hipr's service principal.
+- Only client secrets are supported for `-auth-*`, not certificates or federated credentials.
 - In reverse mode `CONNECT` is rejected, and `-mitm` has no effect.
 - Windows curl (schannel) may report "revocation status is unknown" for the local CA. Add `--ssl-no-revoke`.
 - Many clients skip the proxy for `localhost`. If traffic does not appear, check `NO_PROXY` and the browser's proxy bypass list.

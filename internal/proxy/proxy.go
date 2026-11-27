@@ -26,6 +26,20 @@ type Options struct {
 	Insecure bool          // skip verification of upstream certificates
 	Dial     time.Duration // upstream dial timeout; default 10s
 	Upstream *url.URL      // when set, run as a reverse proxy to this server
+	Modifier RequestModifier
+}
+
+// RequestModifier may change each request just before it is sent upstream,
+// after hop-by-hop headers are removed. A note it returns is recorded on the
+// event. An error fails the request with 502 without sending it.
+type RequestModifier interface {
+	ModifyRequest(*http.Request) (note string, err error)
+}
+
+// ResponseModifier is implemented by a RequestModifier that also wants to
+// see each upstream response before it is relayed.
+type ResponseModifier interface {
+	ModifyResponse(*http.Response)
 }
 
 // Proxy is an http.Handler that acts as a forward proxy, or as a reverse
@@ -95,7 +109,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	ev := &inspect.Event{
 		ID: p.nextID.Add(1), Time: start, Kind: "http", ClientAddr: r.RemoteAddr,
-		Method: r.Method, URL: r.URL.String(), Proto: r.Proto, ReqHeader: r.Header.Clone(),
+		Method: r.Method, URL: r.URL.String(), Proto: r.Proto, ReqHeader: inspect.Redact(r.Header),
 	}
 	reqCap := &capture{max: p.opts.MaxBody}
 	respCap := &capture{max: p.opts.MaxBody}
@@ -111,6 +125,18 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
 	out := r.Clone(r.Context())
 	out.RequestURI = ""
 	stripHopByHop(out.Header)
+	if m := p.opts.Modifier; m != nil {
+		note, err := m.ModifyRequest(out)
+		if note != "" {
+			ev.Notes = append(ev.Notes, note)
+		}
+		if err != nil {
+			ev.Error = err.Error()
+			ev.Status = http.StatusBadGateway
+			http.Error(w, "hipr: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+	}
 	if r.Body != nil && r.Body != http.NoBody {
 		out.Body = struct {
 			io.Reader
@@ -126,9 +152,12 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+	if rm, ok := p.opts.Modifier.(ResponseModifier); ok {
+		rm.ModifyResponse(resp)
+	}
 
 	ev.Status = resp.StatusCode
-	ev.RespHeader = resp.Header.Clone()
+	ev.RespHeader = inspect.Redact(resp.Header)
 	stripHopByHop(resp.Header)
 	maps.Copy(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
