@@ -30,8 +30,25 @@ func main() {
 		insecure = flag.Bool("insecure", false, "do not verify upstream TLS certificates")
 		upstream = flag.String("upstream", "", "run as a reverse proxy in front of this server, e.g. http://localhost:29010")
 		serveTLS = flag.Bool("tls", false, "serve HTTPS on the listen address using a certificate from the local CA")
+		certFile = flag.String("cert", "", "serve HTTPS using this PEM certificate (chain) instead of the local CA; implies -tls")
+		keyFile  = flag.String("key", "", "private key for -cert")
+		authOpts authFlags
 	)
+	authOpts.register()
 	flag.Parse()
+
+	if (*certFile == "") != (*keyFile == "") {
+		log.Fatal("-cert and -key must be given together")
+	}
+	var served *tls.Certificate
+	if *certFile != "" {
+		c, err := tls.LoadX509KeyPair(*certFile, *keyFile)
+		if err != nil {
+			log.Fatalf("loading -cert/-key: %v", err)
+		}
+		served = &c
+		*serveTLS = true
+	}
 
 	var upURL *url.URL
 	if *upstream != "" {
@@ -52,17 +69,31 @@ func main() {
 	}
 
 	opts := proxy.Options{Sink: sinks, MaxBody: *maxBody, Insecure: *insecure, Upstream: upURL}
+	injector, err := authOpts.setup(*addr, upURL, *doMITM)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if injector != nil { // a nil *Injector in the interface would not compare equal to nil
+		opts.Modifier = injector
+	}
 	srv := &http.Server{Addr: *addr, ReadHeaderTimeout: 15 * time.Second}
-	if *doMITM || *serveTLS {
+	if served != nil {
+		srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{*served}}
+	}
+	if (*doMITM && upURL == nil) || (*serveTLS && served == nil) {
 		ca, err := mitm.LoadOrCreate(*caDir)
 		if err != nil {
 			log.Fatal(err)
 		}
-		fmt.Printf("Trust this CA in your client: %s\n", ca.CertPath())
+		if ca.IsRoot() {
+			fmt.Printf("Trust this CA in your client: %s\n", ca.CertPath())
+		} else {
+			fmt.Printf("Using intermediate CA %s: clients must trust the root it chains to\n", ca.CertPath())
+		}
 		if *doMITM && upURL == nil {
 			opts.CA = ca
 		}
-		if *serveTLS {
+		if served == nil && *serveTLS {
 			srv.TLSConfig = &tls.Config{GetCertificate: func(h *tls.ClientHelloInfo) (*tls.Certificate, error) {
 				name := h.ServerName
 				if name == "" {
@@ -87,7 +118,6 @@ func main() {
 		mode = "reverse proxy -> " + upURL.String()
 	}
 	fmt.Printf("hipr listening on %s (%s)\n", *addr, mode)
-	var err error
 	if *serveTLS {
 		err = srv.ListenAndServeTLS("", "")
 	} else {

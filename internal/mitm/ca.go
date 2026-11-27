@@ -2,6 +2,8 @@
 package mitm
 
 import (
+	"bytes"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -10,10 +12,12 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -23,7 +27,8 @@ const leafLifetime = 30 * 24 * time.Hour
 // CA signs per-host leaf certificates on demand.
 type CA struct {
 	cert    *x509.Certificate
-	key     *ecdsa.PrivateKey
+	chain   [][]byte // DER of the non-root certificates in ca.pem, sent after each leaf
+	key     crypto.Signer
 	leafKey *ecdsa.PrivateKey // shared by all leaves; a key per host is needlessly slow
 	pemPath string
 
@@ -33,6 +38,10 @@ type CA struct {
 
 // CertPath is where the CA certificate (to install in clients) lives.
 func (c *CA) CertPath() string { return c.pemPath }
+
+// IsRoot reports whether the CA is self-signed. When it is not, clients must
+// trust the root it chains to rather than ca.pem.
+func (c *CA) IsRoot() bool { return selfSigned(c.cert) }
 
 // CertPEM returns the CA certificate in PEM form.
 func (c *CA) CertPEM() []byte {
@@ -53,6 +62,10 @@ func LoadOrCreate(dir string) (*CA, error) {
 		if keyErr != nil && !errors.Is(keyErr, os.ErrNotExist) {
 			return nil, keyErr
 		}
+		if certErr == nil || keyErr == nil {
+			// Never overwrite half of a CA someone put here.
+			return nil, fmt.Errorf("mitm: %s needs both ca.pem and ca-key.pem, or neither to create a new CA", dir)
+		}
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, err
 		}
@@ -68,24 +81,102 @@ func LoadOrCreate(dir string) (*CA, error) {
 		}
 	}
 
-	cb, _ := pem.Decode(certPEM)
-	kb, _ := pem.Decode(keyPEM)
-	if cb == nil || kb == nil {
-		return nil, errors.New("mitm: invalid PEM in " + dir)
-	}
-	cert, err := x509.ParseCertificate(cb.Bytes)
+	certs, err := parseCerts(certPEM)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("mitm: %s: %w", certPath, err)
 	}
-	key, err := x509.ParseECPrivateKey(kb.Bytes)
+	key, err := parseKey(keyPEM)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("mitm: %s: %w", keyPath, err)
+	}
+	cert := certs[0]
+	if !cert.IsCA || cert.KeyUsage&x509.KeyUsageCertSign == 0 {
+		return nil, fmt.Errorf("mitm: %s is not a CA certificate allowed to sign certificates", certPath)
+	}
+	if !publicKeysEqual(cert.PublicKey, key.Public()) {
+		return nil, fmt.Errorf("mitm: %s does not match the certificate in %s", keyPath, certPath)
+	}
+	// Clients need every intermediate between the leaf and the root they trust,
+	// including cert itself when it is not a root. Roots are left out: the
+	// client has to have them already.
+	var chain [][]byte
+	for _, c := range certs {
+		if !selfSigned(c) {
+			chain = append(chain, c.Raw)
+		}
 	}
 	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, err
 	}
-	return &CA{cert: cert, key: key, leafKey: leafKey, pemPath: certPath, cache: map[string]*tls.Certificate{}}, nil
+	return &CA{cert: cert, chain: chain, key: key, leafKey: leafKey, pemPath: certPath, cache: map[string]*tls.Certificate{}}, nil
+}
+
+// parseCerts returns every CERTIFICATE block in data, in order. The first is
+// the signing CA; any others are the intermediates above it.
+func parseCerts(data []byte) ([]*x509.Certificate, error) {
+	var certs []*x509.Certificate
+	for {
+		var b *pem.Block
+		if b, data = pem.Decode(data); b == nil {
+			break
+		}
+		if b.Type != "CERTIFICATE" {
+			continue
+		}
+		c, err := x509.ParseCertificate(b.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		certs = append(certs, c)
+	}
+	if len(certs) == 0 {
+		return nil, errors.New("no PEM CERTIFICATE block")
+	}
+	return certs, nil
+}
+
+// parseKey reads the first private key block in data, accepting PKCS#8
+// ("PRIVATE KEY"), SEC 1 ("EC PRIVATE KEY") and PKCS#1 ("RSA PRIVATE KEY").
+func parseKey(data []byte) (crypto.Signer, error) {
+	for {
+		var b *pem.Block
+		if b, data = pem.Decode(data); b == nil {
+			return nil, errors.New("no PEM private key block")
+		}
+		if !strings.HasSuffix(b.Type, "PRIVATE KEY") {
+			continue
+		}
+		var key any
+		var err error
+		switch b.Type {
+		case "ENCRYPTED PRIVATE KEY":
+			return nil, errors.New("encrypted private keys are not supported; decrypt it first (openssl pkey -in key.pem -out ca-key.pem)")
+		case "EC PRIVATE KEY":
+			key, err = x509.ParseECPrivateKey(b.Bytes)
+		case "RSA PRIVATE KEY":
+			key, err = x509.ParsePKCS1PrivateKey(b.Bytes)
+		default:
+			key, err = x509.ParsePKCS8PrivateKey(b.Bytes)
+		}
+		if err != nil {
+			return nil, err
+		}
+		s, ok := key.(crypto.Signer)
+		if !ok {
+			return nil, fmt.Errorf("unsupported private key type %T", key)
+		}
+		return s, nil
+	}
+}
+
+func selfSigned(c *x509.Certificate) bool {
+	return bytes.Equal(c.RawIssuer, c.RawSubject) && c.CheckSignatureFrom(c) == nil
+}
+
+func publicKeysEqual(a, b crypto.PublicKey) bool {
+	k, ok := a.(interface{ Equal(crypto.PublicKey) bool })
+	return ok && k.Equal(b)
 }
 
 // Leaf returns a certificate for name (a DNS name or IP), signed by the CA.
@@ -99,11 +190,16 @@ func (c *CA) Leaf(name string) (*tls.Certificate, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A leaf must not outlive its issuer, which a supplied CA may well be close to.
+	notAfter := time.Now().Add(leafLifetime)
+	if notAfter.After(c.cert.NotAfter) {
+		notAfter = c.cert.NotAfter
+	}
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: name, Organization: []string{"hipr"}},
 		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(leafLifetime),
+		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
@@ -120,7 +216,7 @@ func (c *CA) Leaf(name string) (*tls.Certificate, error) {
 	if err != nil {
 		return nil, err
 	}
-	cert := &tls.Certificate{Certificate: [][]byte{der}, PrivateKey: c.leafKey, Leaf: leaf}
+	cert := &tls.Certificate{Certificate: append([][]byte{der}, c.chain...), PrivateKey: c.leafKey, Leaf: leaf}
 	c.cache[name] = cert
 	return cert, nil
 }
