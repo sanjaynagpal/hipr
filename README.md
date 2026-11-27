@@ -56,6 +56,23 @@ curl -x http://127.0.0.1:8080 --cacert .hipr/ca.pem https://example.com/
 
 hipr creates a local certificate authority in `.hipr/` the first time. The client has to trust `.hipr/ca.pem`, otherwise its TLS handshake fails. Keep `.hipr/ca-key.pem` private: anything that trusts the CA will trust certificates signed with it.
 
+### Using certificates from an existing CA
+
+**A signing CA for `-mitm` (or `-tls` without `-cert`).** Put the CA certificate in `ca.pem` and its key in `ca-key.pem` in the `-ca-dir` directory, and hipr uses them instead of creating its own. Clients that already trust your organisation's CA then need no setup.
+
+- The certificate must be a CA allowed to sign certificates (`CA:TRUE`, `keyCertSign`).
+- The key may be ECDSA, RSA or Ed25519, in PKCS#8 (`PRIVATE KEY`), SEC 1 (`EC PRIVATE KEY`) or PKCS#1 (`RSA PRIVATE KEY`) form. Encrypted keys are not supported; decrypt with `openssl pkey -in key.pem -out ca-key.pem`.
+- If it is an intermediate, put it first in `ca.pem`, optionally followed by the certificates above it. hipr sends every non-root certificate with each host certificate, so clients need only trust the root.
+- Both files must be present. If only one is, hipr stops rather than overwriting it.
+
+**A server certificate for `-tls`.** In reverse mode hipr presents one certificate for its own name, so an ordinary server certificate is enough:
+
+```
+hipr -addr :443 -upstream http://localhost:29010 -cert server-chain.pem -key server.key
+```
+
+`-cert` is a PEM file holding the certificate followed by any intermediates. It implies `-tls`, and no local CA is created.
+
 ## Flags
 
 | Flag | Default | Description |
@@ -64,6 +81,7 @@ hipr creates a local certificate authority in `.hipr/` the first time. The clien
 | `-upstream` | none | Run as a reverse proxy in front of this `http://` or `https://` server |
 | `-mitm` | off | Forward mode: decrypt HTTPS using the local CA |
 | `-tls` | off | Serve HTTPS on the listen address with a certificate from the local CA (useful with `-upstream`) |
+| `-cert`, `-key` | none | Serve HTTPS with this certificate (chain) and key instead of one from the local CA. Implies `-tls` |
 | `-ca-dir` | `.hipr` | Directory holding `ca.pem` and `ca-key.pem` |
 | `-insecure` | off | Do not verify the upstream server's TLS certificate (self-signed dev servers) |
 | `-v` | off | Print headers and bodies |

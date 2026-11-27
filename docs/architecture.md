@@ -61,7 +61,13 @@ The URL scheme and host are replaced by the upstream's, the upstream's path is p
 
 ## Certificates
 
-`mitm.LoadOrCreate` reads `ca.pem` and `ca-key.pem` from the CA directory, creating an ECDSA P-256 CA (5 years) on first use. `CA.Leaf(name)` issues a 30-day certificate with the name as a DNS or IP SAN and caches it until an hour before it expires. All leaves share one key, because generating a key per host is slow and the key never leaves the process.
+`mitm.LoadOrCreate` reads `ca.pem` and `ca-key.pem` from the CA directory, creating an ECDSA P-256 CA (5 years) when both are absent. If only one exists it fails rather than overwrite it. A supplied CA can use any key type the standard library signs with (PKCS#8, SEC 1 or PKCS#1 PEM); it must be a CA with `keyCertSign`, and its key must match the certificate.
+
+The first certificate in `ca.pem` signs the leaves. Every certificate in the file that is not self-signed, including the first when it is an intermediate, is kept as the chain and sent after each leaf, so clients need only trust the root.
+
+`CA.Leaf(name)` issues a certificate with the name as a DNS or IP SAN, valid for 30 days or until the CA expires if sooner, and caches it until an hour before it expires. All leaves share one ECDSA key, because generating a key per host is slow and the key never leaves the process.
+
+With `-cert`/`-key`, `main.go` loads that pair with `tls.LoadX509KeyPair` and serves it on the listener; the CA is not loaded unless `-mitm` also needs it.
 
 ## Inspection
 
